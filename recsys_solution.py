@@ -322,14 +322,21 @@ def pop_fill(mat, uids, als_ids_arr, n=N_CANDIDATES):
     for i, uid in enumerate(uids):
         s, e = mat.indptr[uid], mat.indptr[uid + 1]
         seen = set(mat.indices[s:e].tolist())
-        cands = als_ids_arr[i].tolist()
-        cs = set(cands)
+        # Dedupe retriever output and drop invalid/padding indices: degenerate
+        # users (tiny history) can get repeated padding items from implicit.
+        cands, cs = [], set()
+        for it in als_ids_arr[i].tolist():
+            it = int(it)
+            if 0 <= it < n_items and it not in cs:
+                cands.append(it)
+                cs.add(it)
         for it in pop_top_global:
             if len(cands) >= n:
                 break
+            it = int(it)
             if it not in seen and it not in cs:
-                cands.append(int(it))
-                cs.add(int(it))
+                cands.append(it)
+                cs.add(it)
         out[uid] = cands[:n]
     return out
 
@@ -436,28 +443,23 @@ item_stats_pl = train.group_by("item_idx").agg(item_aggs)
 # ── 9c. CTR from impressions ─────────────────────────────────────────────────
 item_ctr_pl = None
 if has_impressions:
-    print("  Item CTR from impressions (lazy)...")
+    print("  Item CTR from impressions (full train, streaming)...")
     t0 = time.time()
 
-    # Use at most 3M rows for CTR estimation (memory safe)
-    n_sample = min(len(train), 3_000_000)
-    train_s = (
-        train.sample(n=n_sample, seed=RANDOM_SEED) if n_sample < len(train) else train
-    )
-
-    # n_shown: how many times each item appeared in any slate
+    # CTR is the single strongest rerank feature — use ALL impressions (no
+    # sampling). 227M exploded rows handled via polars streaming engine.
     n_shown = (
-        train_s.lazy()
+        train.lazy()
         .select("impressions")
         .explode("impressions")
         .rename({"impressions": "item_id"})
         .group_by("item_id")
         .agg(pl.len().alias("n_shown"))
-        .collect()
+        .collect(engine="streaming")
     )
     # n_clicks: how many times each item was the chosen item
     n_clicks = (
-        train_s.lazy().group_by("item_id").agg(pl.len().alias("n_clicks")).collect()
+        train.lazy().group_by("item_id").agg(pl.len().alias("n_clicks")).collect()
     )
     item_ctr_pl = (
         n_clicks.join(n_shown, on="item_id", how="left")
