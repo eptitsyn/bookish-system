@@ -133,7 +133,7 @@ def build(uids):
             rows.append([tr_,ts_,ar_,as_,dot,pop[c],it_stats[c,0],it_stats[c,1],it_stats[c,2],ctr[c],
                          u_stats[u,0],u_stats[u,1],u_stats[u,2],ic,float(ic>0),nret])
         F.append(np.array(rows,np.float32)); Y.append(np.array([1 if c in gt else 0 for c in cand],np.int32))
-        G.append(n); C.append(cand)
+        G.append(n); C.append(np.array(cand,np.int32))
     return np.vstack(F),np.concatenate(Y),np.array(G),C
 
 t=time.time()
