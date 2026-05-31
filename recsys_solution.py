@@ -517,14 +517,64 @@ item_all_feats = item_all_feats.join(
 ).fill_null(0)
 print(f"  item_all_feats: {item_all_feats.shape}")
 
+# ── 9f. Per-user impression counts  (BY FAR the strongest rerank signal) ──────
+# impressions are the platform's own recommendation log. How many times a
+# candidate item was *shown to this specific user* strongly predicts their next
+# interaction — offline this single feature lifts rerank NDCG@20 ~0.16 → ~0.27.
+#
+# Every interaction's slate contains its own clicked item, so we build TWO
+# lookups to keep the training feature distribution identical to test:
+#   • "tr"   from df_tr only  → used for ranker train / val / check frames
+#   • "full" from all train   → used to score the real test users
+# (mirrors U_tr/U_f). This avoids leaking val/test labels into training.
+def build_impr_lookup(df, label):
+    t = time.time()
+    pairs = (
+        df.lazy()
+        .select(["user_idx", "impressions"])
+        .explode("impressions")
+        .join(item_map.lazy(), left_on="impressions", right_on="item_id")
+        .group_by(["user_idx", "item_idx"])
+        .agg(pl.len().alias("c"))
+        .sort(["user_idx", "item_idx"])  # → composite key u*n_items+i is sorted
+        .collect(engine="streaming")
+    )
+    keys = (
+        pairs["user_idx"].to_numpy().astype(np.int64) * n_items
+        + pairs["item_idx"].to_numpy().astype(np.int64)
+    )
+    cnts = pairs["c"].to_numpy().astype(np.float32)
+    print(f"  impr lookup [{label}]: {len(keys):,} pairs in {time.time() - t:.0f}s")
+    return keys, cnts
+
+
+impr_full = impr_tr = (None, None)
+if has_impressions:
+    print("  Per-user impression counts (streaming)...")
+    impr_full = build_impr_lookup(train, "full→test")
+    impr_tr = build_impr_lookup(df_tr, "tr→ranker")
+    gc.collect()
+
+
+def lookup_impr_cnt(u_col, i_col, mode="full"):
+    """Vectorised per-(user,item) impression count via searchsorted."""
+    keys, cnts = impr_full if mode == "full" else impr_tr
+    if keys is None:
+        return np.zeros(len(u_col), np.float32)
+    q = u_col.astype(np.int64) * n_items + i_col.astype(np.int64)
+    pos = np.clip(np.searchsorted(keys, q), 0, len(keys) - 1)
+    valid = keys[pos] == q
+    return np.where(valid, cnts[pos], 0.0).astype(np.float32)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. FEATURE FRAME BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 def build_feature_frame(uids, cands_dict, b_als_ids, b_als_sc, label_pl=None,
-                        U=None, V=None):
-    # U/V: ALS factors used for the als_dot feature. Pass the past-only model
-    # (U_tr/V_tr) when building training/val frames, full model when scoring test.
+                        U=None, V=None, impr_mode="full"):
+    # U/V: ALS factors for als_dot. impr_mode: which impression lookup to use.
+    # Pass U_tr/V_tr + impr_mode="tr" for training/val frames (past-only, no
+    # label leak); defaults (full model) when scoring test.
     if U is None:
         U, V = U_f, V_f
     n_per = [len(cands_dict[u]) for u in uids]
@@ -563,11 +613,16 @@ def build_feature_frame(uids, cands_dict, b_als_ids, b_als_sc, label_pl=None,
         .fill_null(0)
     )
 
-    # ALS embedding dot product (top rerank feature)
+    # ALS embedding dot product (strong rerank feature)
     u_arr = u_col.clip(0, len(U) - 1)
     i_arr = i_col.clip(0, len(V) - 1)
     als_dot = (U[u_arr] * V[i_arr]).sum(axis=1).astype(np.float32)
     df = df.with_columns(pl.Series("als_dot", als_dot, dtype=pl.Float32))
+
+    # Per-user impression count — the single strongest feature
+    df = df.with_columns(
+        pl.Series("impr_cnt", lookup_impr_cnt(u_col, i_col, impr_mode), dtype=pl.Float32)
+    )
 
     if label_pl is not None:
         df = df.join(
@@ -625,10 +680,10 @@ try:
     val_gt_pl = df_val.select(["user_idx", "item_idx"]).unique()
 
     feat_val = build_feature_frame(
-        val_s, v_cands, v_ids, v_sc, label_pl=val_gt_pl, U=U_tr, V=V_tr
+        val_s, v_cands, v_ids, v_sc, label_pl=val_gt_pl, U=U_tr, V=V_tr, impr_mode="tr"
     )
     feat_tr_ = build_feature_frame(
-        tr_s, t_cands, t_ids, t_sc, label_pl=val_gt_pl, U=U_tr, V=V_tr
+        tr_s, t_cands, t_ids, t_sc, label_pl=val_gt_pl, U=U_tr, V=V_tr, impr_mode="tr"
     )
 
     IGNORE = {"user_idx", "item_idx", "label"}
@@ -731,7 +786,8 @@ print(
 # Re-rank NDCG (if LightGBM trained)
 if USE_LGBM:
     feat_check = build_feature_frame(
-        check_uids, cands_val_check, ids_val_check, sc_val_check, U=U_tr, V=V_tr
+        check_uids, cands_val_check, ids_val_check, sc_val_check,
+        U=U_tr, V=V_tr, impr_mode="tr"
     )
     X_check = feat_check.select(feature_cols).to_numpy().astype(np.float32)
     feat_check = feat_check.with_columns(

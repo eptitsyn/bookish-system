@@ -1,6 +1,7 @@
 """
 Kaggle Recommender System — v5
 • Weighted ALS: is_purchased×5 + rating (instead of binary)
+• Hybrid retrieval: TF-IDF ItemKNN candidates + iALS candidates + popularity fill
 • Rich features: purchase_rate, avg_rating, CTR from impressions, recency
 • NDCG fix: validation uses als_tr candidates (no val-data leakage)
 • Batched OOM-safe scoring
@@ -9,6 +10,7 @@ Kaggle Recommender System — v5
 
 import warnings
 import gc
+import os
 import time
 
 import numpy as np
@@ -17,6 +19,7 @@ import scipy.sparse as sp
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -25,9 +28,11 @@ DATA_DIR = Path("./data")
 OUT_DIR = Path("./output")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-N_CANDIDATES = 200
+N_CANDIDATES = 300
 TOP_K = 20
 TFIDF_K = 500  # item-item neighbourhood size — primary retriever
+TFIDF_CANDIDATES = 220
+ALS_CANDIDATES = 120
 ALS_FACTORS = 64  # ALS kept only for the als_dot rerank feature
 ALS_ITERS = 15
 ALS_REG = 0.01
@@ -317,7 +322,7 @@ def als_recommend(model, mat, uids, n=N_CANDIDATES):
     return model.recommend(arr, mat[arr], N=n, filter_already_liked_items=True)
 
 
-def pop_fill(mat, uids, als_ids_arr, n=N_CANDIDATES):
+def pop_fill(mat, uids, primary_ids_arr, extra_ids_arr=None, n=N_CANDIDATES):
     out = {}
     for i, uid in enumerate(uids):
         s, e = mat.indptr[uid], mat.indptr[uid + 1]
@@ -325,11 +330,18 @@ def pop_fill(mat, uids, als_ids_arr, n=N_CANDIDATES):
         # Dedupe retriever output and drop invalid/padding indices: degenerate
         # users (tiny history) can get repeated padding items from implicit.
         cands, cs = [], set()
-        for it in als_ids_arr[i].tolist():
-            it = int(it)
-            if 0 <= it < n_items and it not in cs:
-                cands.append(it)
-                cs.add(it)
+        for ids_arr in (primary_ids_arr, extra_ids_arr):
+            if ids_arr is None:
+                continue
+            for it in ids_arr[i].tolist():
+                it = int(it)
+                if 0 <= it < n_items and it not in cs:
+                    cands.append(it)
+                    cs.add(it)
+                if len(cands) >= n:
+                    break
+            if len(cands) >= n:
+                break
         for it in pop_top_global:
             if len(cands) >= n:
                 break
@@ -353,19 +365,39 @@ cold_users = [u for u in test_list if u not in user_id_set]
 print(f"Warm: {len(warm_uids):,}  Cold: {len(cold_users):,}")
 
 # Batched TFIDF recommend
-ids_l, sc_l = [], []
+tfidf_ids_l, tfidf_sc_l = [], []
 t0 = time.time()
 for s in range(0, len(warm_uids), ALS_BATCH):
-    ib, sb = als_recommend(tfidf_full, mat_full, warm_uids[s : s + ALS_BATCH])
-    ids_l.append(ib)
-    sc_l.append(sb)
+    ib, sb = als_recommend(
+        tfidf_full, mat_full, warm_uids[s : s + ALS_BATCH], n=TFIDF_CANDIDATES
+    )
+    tfidf_ids_l.append(ib)
+    tfidf_sc_l.append(sb)
     if s % (ALS_BATCH * 8) == 0:
         print(f"  TFIDF recommend {s:,}/{len(warm_uids):,}", end="\r")
 
-als_ids = np.vstack(ids_l)  # (n_warm, N_CANDIDATES)
-als_sc_arr = np.vstack(sc_l)  # (n_warm, N_CANDIDATES)
+tfidf_ids = np.vstack(tfidf_ids_l)  # (n_warm, TFIDF_CANDIDATES)
+tfidf_sc_arr = np.vstack(tfidf_sc_l)  # (n_warm, TFIDF_CANDIDATES)
 print(f"\n  Done in {time.time() - t0:.1f}s")
-candidates = pop_fill(mat_full, warm_uids, als_ids)
+
+# ALS has lower standalone NDCG than TF-IDF here, but its misses are useful
+# for recall. Keep it as a secondary candidate source and expose its own rank
+# and score to the ranker.
+als_ids_l, als_sc_l = [], []
+t0 = time.time()
+for s in range(0, len(warm_uids), ALS_BATCH):
+    ib, sb = als_recommend(
+        als_full, mat_full, warm_uids[s : s + ALS_BATCH], n=ALS_CANDIDATES
+    )
+    als_ids_l.append(ib)
+    als_sc_l.append(sb)
+    if s % (ALS_BATCH * 8) == 0:
+        print(f"  ALS recommend {s:,}/{len(warm_uids):,}", end="\r")
+
+als_rec_ids = np.vstack(als_ids_l)
+als_rec_sc_arr = np.vstack(als_sc_l)
+print(f"\n  Done in {time.time() - t0:.1f}s")
+candidates = pop_fill(mat_full, warm_uids, tfidf_ids, als_rec_ids)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. FEATURE ENGINEERING
@@ -522,7 +554,15 @@ print(f"  item_all_feats: {item_all_feats.shape}")
 # 10. FEATURE FRAME BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 def build_feature_frame(
-    uids, cands_dict, b_als_ids, b_als_sc, label_pl=None, U=None, V=None
+    uids,
+    cands_dict,
+    b_tfidf_ids,
+    b_tfidf_sc,
+    label_pl=None,
+    U=None,
+    V=None,
+    b_als_ids=None,
+    b_als_sc=None,
 ):
     # U/V: ALS factors used for the als_dot feature. Pass the past-only model
     # (U_tr/V_tr) when building training/val frames, full model when scoring test.
@@ -534,17 +574,40 @@ def build_feature_frame(
     i_col = np.concatenate([np.array(cands_dict[u], np.int32) for u in uids])
     rank_col = np.concatenate([np.arange(n, dtype=np.int32) for n in n_per])
 
-    ret_sc_col = np.zeros(total, np.float32)
-    from_ret_col = np.zeros(total, np.int32)
+    tfidf_sc_col = np.zeros(total, np.float32)
+    tfidf_rank_col = np.full(total, N_CANDIDATES + 1, np.int32)
+    from_tfidf_col = np.zeros(total, np.int32)
+    als_rec_sc_col = np.zeros(total, np.float32)
+    als_rec_rank_col = np.full(total, N_CANDIDATES + 1, np.int32)
+    from_als_rec_col = np.zeros(total, np.int32)
     offset = 0
     for j in range(len(uids)):
         n = n_per[j]
-        lkp = dict(zip(b_als_ids[j].tolist(), b_als_sc[j].tolist()))
+        tfidf_lkp = {
+            int(iid): (rank, float(score))
+            for rank, (iid, score) in enumerate(
+                zip(b_tfidf_ids[j].tolist(), b_tfidf_sc[j].tolist())
+            )
+        }
+        als_lkp = {}
+        if b_als_ids is not None and b_als_sc is not None:
+            als_lkp = {
+                int(iid): (rank, float(score))
+                for rank, (iid, score) in enumerate(
+                    zip(b_als_ids[j].tolist(), b_als_sc[j].tolist())
+                )
+            }
         for k, iid in enumerate(i_col[offset : offset + n]):
-            v = lkp.get(int(iid))
-            if v is not None:
-                ret_sc_col[offset + k] = v
-                from_ret_col[offset + k] = 1
+            tfidf_hit = tfidf_lkp.get(int(iid))
+            if tfidf_hit is not None:
+                tfidf_rank_col[offset + k] = tfidf_hit[0]
+                tfidf_sc_col[offset + k] = tfidf_hit[1]
+                from_tfidf_col[offset + k] = 1
+            als_hit = als_lkp.get(int(iid))
+            if als_hit is not None:
+                als_rec_rank_col[offset + k] = als_hit[0]
+                als_rec_sc_col[offset + k] = als_hit[1]
+                from_als_rec_col[offset + k] = 1
         offset += n
 
     df = pl.DataFrame(
@@ -552,8 +615,12 @@ def build_feature_frame(
             "user_idx": pl.Series(u_col, dtype=pl.Int32),
             "item_idx": pl.Series(i_col, dtype=pl.Int32),
             "cand_rank": pl.Series(rank_col, dtype=pl.Int32),
-            "ret_score": pl.Series(ret_sc_col, dtype=pl.Float32),
-            "from_ret": pl.Series(from_ret_col, dtype=pl.Int32),
+            "tfidf_score": pl.Series(tfidf_sc_col, dtype=pl.Float32),
+            "tfidf_rank": pl.Series(tfidf_rank_col, dtype=pl.Int32),
+            "from_tfidf": pl.Series(from_tfidf_col, dtype=pl.Int32),
+            "als_rec_score": pl.Series(als_rec_sc_col, dtype=pl.Float32),
+            "als_rec_rank": pl.Series(als_rec_rank_col, dtype=pl.Int32),
+            "from_als_rec": pl.Series(from_als_rec_col, dtype=pl.Int32),
             "pop_score": pl.Series(item_popularity[i_col], dtype=pl.Float32),
         }
     )
@@ -620,18 +687,36 @@ try:
         f"  ranker train={len(tr_s):,}  valid={len(val_s):,} — generating candidates..."
     )
     # ── IMPORTANT: use tfidf_tr + mat_tr so val items are NOT filtered ──────
-    v_ids, v_sc = batch_als_fn(tfidf_tr, mat_tr, val_s)
-    t_ids, t_sc = batch_als_fn(tfidf_tr, mat_tr, tr_s)
-    v_cands = pop_fill(mat_tr, val_s, v_ids)
-    t_cands = pop_fill(mat_tr, tr_s, t_ids)
+    v_ids, v_sc = batch_als_fn(tfidf_tr, mat_tr, val_s, n=TFIDF_CANDIDATES)
+    t_ids, t_sc = batch_als_fn(tfidf_tr, mat_tr, tr_s, n=TFIDF_CANDIDATES)
+    v_als_ids, v_als_sc = batch_als_fn(als_tr, mat_tr, val_s, n=ALS_CANDIDATES)
+    t_als_ids, t_als_sc = batch_als_fn(als_tr, mat_tr, tr_s, n=ALS_CANDIDATES)
+    v_cands = pop_fill(mat_tr, val_s, v_ids, v_als_ids)
+    t_cands = pop_fill(mat_tr, tr_s, t_ids, t_als_ids)
 
     val_gt_pl = df_val.select(["user_idx", "item_idx"]).unique()
 
     feat_val = build_feature_frame(
-        val_s, v_cands, v_ids, v_sc, label_pl=val_gt_pl, U=U_tr, V=V_tr
+        val_s,
+        v_cands,
+        v_ids,
+        v_sc,
+        label_pl=val_gt_pl,
+        U=U_tr,
+        V=V_tr,
+        b_als_ids=v_als_ids,
+        b_als_sc=v_als_sc,
     )
     feat_tr_ = build_feature_frame(
-        tr_s, t_cands, t_ids, t_sc, label_pl=val_gt_pl, U=U_tr, V=V_tr
+        tr_s,
+        t_cands,
+        t_ids,
+        t_sc,
+        label_pl=val_gt_pl,
+        U=U_tr,
+        V=V_tr,
+        b_als_ids=t_als_ids,
+        b_als_sc=t_als_sc,
     )
 
     IGNORE = {"user_idx", "item_idx", "label"}
@@ -718,8 +803,13 @@ check_pool = [u for u in val_gt.keys() if u not in ranker_train_set]
 rng2 = np.random.default_rng(RANDOM_SEED + 1)
 check_uids = rng2.choice(check_pool, min(2000, len(check_pool)), replace=False).tolist()
 
-ids_val_check, sc_val_check = batch_als_fn(tfidf_tr, mat_tr, check_uids)
-cands_val_check = pop_fill(mat_tr, check_uids, ids_val_check)
+ids_val_check, sc_val_check = batch_als_fn(
+    tfidf_tr, mat_tr, check_uids, n=TFIDF_CANDIDATES
+)
+als_ids_val_check, als_sc_val_check = batch_als_fn(
+    als_tr, mat_tr, check_uids, n=ALS_CANDIDATES
+)
+cands_val_check = pop_fill(mat_tr, check_uids, ids_val_check, als_ids_val_check)
 
 # Retrieval NDCG
 ndcg_retrieval = [
@@ -732,7 +822,14 @@ print(
 # Re-rank NDCG (if LightGBM trained)
 if USE_LGBM:
     feat_check = build_feature_frame(
-        check_uids, cands_val_check, ids_val_check, sc_val_check, U=U_tr, V=V_tr
+        check_uids,
+        cands_val_check,
+        ids_val_check,
+        sc_val_check,
+        U=U_tr,
+        V=V_tr,
+        b_als_ids=als_ids_val_check,
+        b_als_sc=als_sc_val_check,
     )
     X_check = feat_check.select(feature_cols).to_numpy().astype(np.float32)
     feat_check = feat_check.with_columns(
@@ -770,19 +867,28 @@ t0 = time.time()
 for bstart in range(0, n_warm, SCORE_BATCH):
     bend = min(bstart + SCORE_BATCH, n_warm)
     b_uids = warm_uids[bstart:bend]
-    b_als_ids = als_ids[bstart:bend]
-    b_als_sc = als_sc_arr[bstart:bend]
+    b_tfidf_ids = tfidf_ids[bstart:bend]
+    b_tfidf_sc = tfidf_sc_arr[bstart:bend]
+    b_als_ids = als_rec_ids[bstart:bend]
+    b_als_sc = als_rec_sc_arr[bstart:bend]
     b_cands = {u: candidates[u] for u in b_uids}
 
     if USE_LGBM:
-        feat_b = build_feature_frame(b_uids, b_cands, b_als_ids, b_als_sc)
+        feat_b = build_feature_frame(
+            b_uids,
+            b_cands,
+            b_tfidf_ids,
+            b_tfidf_sc,
+            b_als_ids=b_als_ids,
+            b_als_sc=b_als_sc,
+        )
         X_b = feat_b.select(feature_cols).to_numpy().astype(np.float32)
         feat_b = feat_b.with_columns(
             pl.Series("lgbm_score", lgb_model.predict(X_b).astype(np.float32))
         )
         top_b = (
-            feat_b.sort("lgbm_score", descending=True)
-            .group_by("user_idx", maintain_order=False)
+            feat_b.sort(["user_idx", "lgbm_score"], descending=[False, True])
+            .group_by("user_idx", maintain_order=True)
             .head(TOP_K)
         )
         u_np = top_b["user_idx"].to_numpy()
@@ -793,14 +899,17 @@ for bstart in range(0, n_warm, SCORE_BATCH):
         u_np_l, i_np_l = [], []
         for j, uid in enumerate(b_uids):
             cands = b_cands[uid]
-            sc_als = b_als_sc[j, : len(cands)].copy()
-            if len(sc_als) < len(cands):
-                sc_als = np.pad(sc_als, (0, len(cands) - len(sc_als)))
+            tfidf_lkp = dict(zip(b_tfidf_ids[j].tolist(), b_tfidf_sc[j].tolist()))
+            als_lkp = dict(zip(b_als_ids[j].tolist(), b_als_sc[j].tolist()))
+            sc_tfidf = np.array([tfidf_lkp.get(it, 0.0) for it in cands], np.float32)
+            sc_als = np.array([als_lkp.get(it, 0.0) for it in cands], np.float32)
             sc_pop = item_popularity[cands]
             mm = lambda x: (
                 (x - x.min()) / (x.max() - x.min() + 1e-9) if x.max() > x.min() else x
             )
-            order = np.argsort(-(0.8 * mm(sc_als) + 0.2 * mm(sc_pop)))[:TOP_K]
+            order = np.argsort(
+                -(0.65 * mm(sc_tfidf) + 0.25 * mm(sc_als) + 0.10 * mm(sc_pop))
+            )[:TOP_K]
             u_np_l.extend([uid] * TOP_K)
             i_np_l.extend(np.array(cands)[order])
         u_np = np.array(u_np_l, np.int32)
